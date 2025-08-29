@@ -4,7 +4,17 @@ import serial
 import threading
 import time
 import random
+import colorsys
 from typing import Optional
+
+# Importa GPIO per Raspberry Pi (con fallback per test su PC)
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+    print("GPIO di Raspberry Pi disponibile")
+except ImportError:
+    GPIO_AVAILABLE = False
+    print("GPIO non disponibile - modalità test attivata (usa SPAZIO per simulare il pulsante)")
 
 # Inizializzazione pygame
 pygame.init()
@@ -13,6 +23,9 @@ pygame.init()
 SCREEN_WIDTH = 1024
 SCREEN_HEIGHT = 768
 FPS = 60
+
+# Pin GPIO per il pulsante (modifica secondo il tuo setup)
+BUTTON_PIN = 18
 
 # Colori
 BLACK = (0, 0, 0)
@@ -63,21 +76,29 @@ class ParticleEffect:
 class AlcoholMeter:
     def __init__(self):
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        pygame.display.set_caption("Etilometro Digitale")
+        pygame.display.set_caption("Alcohol test Barboun")
         self.clock = pygame.time.Clock()
         self.running = True
+
+        # Stati del sistema
+        self.STATE_WAITING = 0      # Schermata iniziale - aspetta il pulsante
+        self.STATE_INSTRUCTIONS = 1  # Mostra istruzioni per 10 secondi
+        self.STATE_READING = 2      # Sta leggendo il valore alcolico
+        self.STATE_RESULT = 3       # Mostra il risultato finale
+        
+        self.current_state = self.STATE_WAITING
+        self.state_timer = 0
+        
+        # Durate degli stati (in frames a 60 FPS)
+        self.instructions_duration = 300  # 10 secondi
+        self.reading_duration = 300       # 5 secondi  
+        self.result_duration = 300        # 5 secondi
 
         # Variabili per il valore alcolico
         self.current_value = 0.0
         self.target_value = 0.0
         self.max_value = 2.5
         self.max_reached_value = 0.0  # Valore massimo raggiunto
-
-        # Stati del sistema
-        self.reading_phase = True  # True = sta leggendo, False = mostra risultato
-        self.reading_timer = 0  # Timer per la fase di lettura (5 secondi)
-        self.result_timer = 0  # Timer per la fase del risultato (5 secondi)
-        self.phase_duration = 300  # 5 secondi a 60 FPS
 
         # Animazioni
         self.needle_angle = 180  # Inizia a sinistra (180°) per mezzaluna orizzontale
@@ -88,8 +109,15 @@ class AlcoholMeter:
         self.result_scale = 1.0  # Scala per l'animazione del risultato finale
         self.result_glow = 0
 
+        # Animazione per la schermata iniziale
+        self.waiting_pulse = 0
+        self.button_pressed = False
+
         # Particelle
         self.particles = []
+
+        # Setup GPIO
+        self.setup_gpio()
 
         # Comunicazione seriale (commentata per test)
         self.ser = None
@@ -109,17 +137,49 @@ class AlcoholMeter:
         self.font_large = pygame.font.Font(None, 72)
         self.font_medium = pygame.font.Font(None, 48)
         self.font_small = pygame.font.Font(None, 32)
+        self.font_extra_large = pygame.font.Font(None, 120)
 
         # Centro del tachimetro (mezzaluna orizzontale)
         self.center_x = SCREEN_WIDTH // 2
         self.center_y = SCREEN_HEIGHT // 2 + 100
         self.radius = 250
 
+        # Lista di istruzioni (puoi personalizzare)
+        self.instructions = [
+            "1. Mettiti a 10-15cm dal buco",
+            "2. Soffia per circa 5 secondi",
+            "3. Aspetta che appaia il risultato finale",
+            "",
+            "",
+            "-- Questo è un gioco, non è preciso --",
+        ]
+
+    def setup_gpio(self):
+        global GPIO_AVAILABLE
+        """Configura i pin GPIO del Raspberry Pi"""
+        if GPIO_AVAILABLE:
+            try:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                # Aggiungi callback per il pulsante (fronte di discesa)
+                GPIO.add_event_detect(BUTTON_PIN, GPIO.FALLING, 
+                                    callback=self.button_callback, bouncetime=300)
+                print(f"GPIO setup completato - Pulsante su pin {BUTTON_PIN}")
+            except Exception as e:
+                print(f"Errore setup GPIO: {e}")
+                GPIO_AVAILABLE = False
+
+    def button_callback(self, channel):
+        """Callback chiamata quando il pulsante viene premuto"""
+        if self.current_state == self.STATE_WAITING:
+            self.button_pressed = True
+            print("Pulsante premuto - avvio test")
+
     def setup_serial(self):
         """Configura la comunicazione seriale"""
         try:
             # Sostituisci 'COM3' con la porta corretta del tuo dispositivo
-            # Su Linux/Mac potrebbe essere '/dev/ttyUSB0' o '/dev/ttyACM0'
+            # Su Linux/Mac potrebbe essere '/dev/ttyUSB0' or '/dev/ttyACM0'
             self.ser = serial.Serial("COM3", 9600, timeout=1)
             self.serial_thread = threading.Thread(target=self.read_serial, daemon=True)
             self.serial_thread.start()
@@ -144,13 +204,50 @@ class AlcoholMeter:
                 print(f"Errore lettura seriale: {e}")
             time.sleep(0.1)
 
+    def update_state_machine(self):
+        """Gestisce la macchina a stati"""
+        if self.current_state == self.STATE_WAITING:
+            # Aspetta che il pulsante venga premuto
+            if self.button_pressed:
+                self.current_state = self.STATE_INSTRUCTIONS
+                self.state_timer = 0
+                self.button_pressed = False
+                
+        elif self.current_state == self.STATE_INSTRUCTIONS:
+            # Mostra istruzioni per 10 secondi
+            self.state_timer += 1
+            if self.state_timer >= self.instructions_duration:
+                self.current_state = self.STATE_READING
+                self.state_timer = 0
+                # Reset valori per la nuova lettura
+                self.current_value = 0.0
+                self.target_value = 0.0
+                self.max_reached_value = 0.0
+                
+        elif self.current_state == self.STATE_READING:
+            # Fase di lettura per 5 secondi
+            self.state_timer += 1
+            if self.state_timer >= self.reading_duration:
+                self.current_state = self.STATE_RESULT
+                self.state_timer = 0
+                # Imposta il valore finale al massimo raggiunto
+                self.current_value = self.max_reached_value
+                
+        elif self.current_state == self.STATE_RESULT:
+            # Mostra risultato per 5 secondi
+            self.state_timer += 1
+            if self.state_timer >= self.result_duration:
+                # Torna alla schermata iniziale
+                self.current_state = self.STATE_WAITING
+                self.state_timer = 0
+                self.waiting_pulse = 0
+
     def update_values(self):
-        """Aggiorna i valori con animazioni fluide e gestisce le fasi di lettura"""
-
-        if self.reading_phase:
-            # FASE DI LETTURA (5 secondi)
-            self.reading_timer += 1
-
+        """Aggiorna i valori con animazioni fluide"""
+        self.update_state_machine()
+        
+        if self.current_state == self.STATE_READING:
+            # Solo durante la lettura aggiorna i valori
             # Interpolazione fluida del valore corrente
             diff = self.target_value - self.current_value
             self.current_value += diff * 0.1
@@ -158,30 +255,10 @@ class AlcoholMeter:
             # Aggiorna il valore massimo raggiunto durante la lettura
             if self.current_value > self.max_reached_value:
                 self.max_reached_value = self.current_value
-
-            # Controlla se i 5 secondi di lettura sono passati
-            if self.reading_timer >= self.phase_duration:
-                self.reading_phase = False
-                self.result_timer = 0
-                # Imposta il valore corrente al massimo raggiunto per l'animazione
-                self.current_value = self.max_reached_value
-
-        else:
-            # FASE RISULTATO (5 secondi)
-            self.result_timer += 1
-
+                
+        elif self.current_state == self.STATE_RESULT:
             # Mantieni il valore al massimo raggiunto
             self.current_value = self.max_reached_value
-
-            # Controlla se i 5 secondi di risultato sono passati
-            if self.result_timer >= self.phase_duration:
-                # Riavvia il ciclo
-                self.reading_phase = True
-                self.reading_timer = 0
-                self.result_timer = 0
-                self.max_reached_value = 0.0
-                self.current_value = 0.0
-                self.target_value = 0.0
 
         # Calcola l'angolo della freccia (da 180° a 0° per mezzaluna orizzontale)
         progress = self.current_value / self.max_value
@@ -191,8 +268,8 @@ class AlcoholMeter:
         angle_diff = self.target_angle - self.needle_angle
         self.needle_angle += angle_diff * 0.15
 
-        # Animazione del risultato finale (solo nella fase risultato)
-        if not self.reading_phase:
+        # Animazioni varie
+        if self.current_state == self.STATE_RESULT:
             self.result_scale = 1.0 + 0.3 * abs(math.sin(self.pulse_time * 3))
             self.result_glow = 50 + 80 * abs(math.sin(self.pulse_time * 4))
         else:
@@ -201,6 +278,7 @@ class AlcoholMeter:
 
         # Aggiorna effetti
         self.pulse_time += 0.1
+        self.waiting_pulse += 0.05
         self.glow_intensity += self.glow_direction * 5
         if self.glow_intensity >= 100:
             self.glow_direction = -1
@@ -209,7 +287,7 @@ class AlcoholMeter:
 
     def add_particles(self):
         """Aggiunge particelle in base al livello alcolico"""
-        if self.current_value > 0.5:
+        if self.current_state == self.STATE_READING and self.current_value > 0.5:
             num_particles = int(self.current_value * 3)
             for _ in range(num_particles):
                 x = self.center_x + random.randint(-50, 50)
@@ -229,10 +307,10 @@ class AlcoholMeter:
         self.particles = [p for p in self.particles if p.update()]
 
     def get_status_color(self):
-        """Restituisce il colore in base al livello alcolico (basato sul valore massimo se in fase risultato)"""
-        value_to_check = (
-            self.max_reached_value if not self.reading_phase else self.current_value
-        )
+        """Restituisce il colore in base al livello alcolico"""
+        value_to_check = self.current_value
+        if self.current_state == self.STATE_RESULT:
+            value_to_check = self.max_reached_value
 
         if value_to_check < 0.5:
             return NEON_GREEN
@@ -245,8 +323,7 @@ class AlcoholMeter:
 
     def get_status_text(self):
         """Restituisce il testo dello stato"""
-        if not self.reading_phase:
-            # Fase risultato - basato sul valore massimo
+        if self.current_state == self.STATE_RESULT:
             if self.max_reached_value < 0.5:
                 return "SOBRIO"
             elif self.max_reached_value < 1.5:
@@ -256,15 +333,7 @@ class AlcoholMeter:
             else:
                 return "PERICOLOSO"
         else:
-            # Fase lettura - basato sul valore corrente
-            if self.current_value < 0.5:
-                return "LETTURA IN CORSO..."
-            elif self.current_value < 1.5:
-                return "LETTURA IN CORSO..."
-            elif self.current_value < 2.0:
-                return "LETTURA IN CORSO..."
-            else:
-                return "LETTURA IN CORSO..."
+            return "LETTURA IN CORSO..."
 
     def draw_background(self):
         """Disegna lo sfondo con effetti"""
@@ -277,15 +346,93 @@ class AlcoholMeter:
             pygame.draw.line(self.screen, (r, g, b), (0, y), (SCREEN_WIDTH, y))
 
         # Effetto pulse di sfondo
-        if self.current_value > 1.0:
+        if self.current_value > 1.0 and self.current_state in [self.STATE_READING, self.STATE_RESULT]:
             pulse = abs(math.sin(self.pulse_time)) * 30
             overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
             color = (*self.get_status_color()[:3], int(pulse))
             overlay.fill(color)
             self.screen.blit(overlay, (0, 0))
 
+    def cycle_colors_hsv(t, speed=0.02):
+        h = (t * speed) % 1.0   # Hue da 0 a 1
+        r, g, b = colorsys.hsv_to_rgb(h, 1, 1)
+        return int(r*255), int(g*255), int(b*255)
+    
+    def draw_waiting_screen(self):
+        """Disegna la schermata di attesa iniziale"""
+        # Titolo principale
+        title_surface = self.font_extra_large.render("Alcohol test Barboun", True, WHITE)
+        title_rect = title_surface.get_rect(center=(self.center_x, 200))
+        self.screen.blit(title_surface, title_rect)
+
+        # Messaggio pulsante con effetto pulsante
+        pulse_alpha = int(128 + 127 * abs(math.sin(self.waiting_pulse * 1)))
+        r, g, b = AlcoholMeter.cycle_colors_hsv(self.waiting_pulse, speed=0.05)  # speed regola la velocità del ciclo
+        button_color = (r, g, b, pulse_alpha)
+        #button_color = (*NEON_GREEN[:3], pulse_alpha)
+        
+        button_text = "PREMI IL PULSANTE PER INIZIARE"
+        button_surface = self.font_large.render(button_text, True, WHITE)
+        button_rect = button_surface.get_rect(center=(self.center_x, self.center_y))
+        
+        # Sfondo pulsante con glow
+        glow_rect = pygame.Rect(button_rect.x - 50, button_rect.y - 30, 
+                               button_rect.width + 100, button_rect.height + 60)
+        glow_surface = pygame.Surface((glow_rect.width, glow_rect.height), pygame.SRCALPHA)
+        pygame.draw.rect(glow_surface, button_color, (0, 0, glow_rect.width, glow_rect.height), 
+                        border_radius=30)
+        self.screen.blit(glow_surface, (glow_rect.x, glow_rect.y))
+        
+        # Bordo del pulsante
+        pygame.draw.rect(self.screen, NEON_GREEN, glow_rect, 5, border_radius=30)
+        
+        # Testo del pulsante
+        self.screen.blit(button_surface, button_rect)
+
+        # Istruzioni in piccolo in basso
+        if not GPIO_AVAILABLE:
+            demo_text = "MODALITÀ DEMO - Premi SPAZIO per simulare il pulsante"
+            demo_surface = self.font_small.render(demo_text, True, LIGHT_GRAY)
+            demo_rect = demo_surface.get_rect(center=(self.center_x, SCREEN_HEIGHT - 50))
+            self.screen.blit(demo_surface, demo_rect)
+
+    def draw_instructions_screen(self):
+        """Disegna la schermata delle istruzioni"""
+        # Titolo
+        title_surface = self.font_large.render("ISTRUZIONI PER L'USO", True, WHITE)
+        title_rect = title_surface.get_rect(center=(self.center_x, 120))
+        self.screen.blit(title_surface, title_rect)
+
+        # Box delle istruzioni
+        box_width = 800
+        box_height = 400
+        box_x = (SCREEN_WIDTH - box_width) // 2
+        box_y = 200
+        
+        # Sfondo del box
+        box_rect = pygame.Rect(box_x, box_y, box_width, box_height)
+        pygame.draw.rect(self.screen, (30, 30, 60), box_rect, border_radius=20)
+        pygame.draw.rect(self.screen, NEON_YELLOW, box_rect, 5, border_radius=20)
+
+        # Disegna le istruzioni
+        y_offset = box_y + 50
+        for i, instruction in enumerate(self.instructions):
+            instruction_surface = self.font_medium.render(instruction, True, WHITE)
+            instruction_rect = instruction_surface.get_rect(center=(self.center_x, y_offset + i * 60))
+            self.screen.blit(instruction_surface, instruction_rect)
+
+        # Timer countdown
+        remaining_time = max(0, (self.instructions_duration - self.state_timer) / 60)
+        timer_text = f"Il test inizierà tra: {remaining_time:.1f}s"
+        timer_surface = self.font_medium.render(timer_text, True, NEON_GREEN)
+        timer_rect = timer_surface.get_rect(center=(self.center_x, box_y + box_height + 50))
+        self.screen.blit(timer_surface, timer_rect)
+
     def draw_gauge(self):
         """Disegna il tachimetro a mezzaluna orizzontale"""
+        if self.current_state not in [self.STATE_READING, self.STATE_RESULT]:
+            return
+            
         # Effetto glow per l'arco
         glow_radius = self.radius + 30
         glow_surface = pygame.Surface(
@@ -382,6 +529,9 @@ class AlcoholMeter:
 
     def draw_needle(self):
         """Disegna la freccia del tachimetro"""
+        if self.current_state not in [self.STATE_READING, self.STATE_RESULT]:
+            return
+            
         angle_rad = math.radians(self.needle_angle)
         needle_length = self.radius - 50
 
@@ -458,11 +608,14 @@ class AlcoholMeter:
         pygame.draw.circle(self.screen, WHITE, (self.center_x, self.center_y), 6)
 
     def draw_display(self):
-        """Disegna il display digitale con font normale (pronto per font personalizzato)"""
+        """Disegna il display digitale"""
+        if self.current_state not in [self.STATE_READING, self.STATE_RESULT]:
+            return
+            
         # Display principale
         display_y = self.center_y + 120
 
-        if self.reading_phase:
+        if self.current_state == self.STATE_READING:
             # FASE DI LETTURA - Mostra valore corrente
             current_color = self.get_status_color()
 
@@ -489,7 +642,7 @@ class AlcoholMeter:
             self.screen.blit(value_surface, value_rect)
 
             # Timer di lettura
-            remaining_time = max(0, (self.phase_duration - self.reading_timer) / 60)
+            remaining_time = max(0, (self.reading_duration - self.state_timer) / 60)
             timer_text = f"Tempo: {remaining_time:.1f}s"
             timer_surface = self.font_small.render(timer_text, True, WHITE)
             timer_rect = timer_surface.get_rect(center=(self.center_x, display_y - 30))
@@ -548,7 +701,7 @@ class AlcoholMeter:
             self.screen.blit(max_value_surface, max_value_rect)
 
             # Timer per il prossimo ciclo
-            remaining_time = max(0, (self.phase_duration - self.result_timer) / 60)
+            remaining_time = max(0, (self.result_duration - self.state_timer) / 60)
             timer_text = f"Nuovo test in: {remaining_time:.1f}s"
             timer_surface = self.font_small.render(timer_text, True, WHITE)
             timer_rect = timer_surface.get_rect(center=(self.center_x, display_y - 40))
@@ -562,6 +715,9 @@ class AlcoholMeter:
 
     def draw_status(self):
         """Disegna lo status e le informazioni"""
+        if self.current_state not in [self.STATE_READING, self.STATE_RESULT]:
+            return
+            
         # Status text
         status_text = self.get_status_text()
         status_surface = self.font_medium.render(
@@ -590,8 +746,13 @@ class AlcoholMeter:
             if event.type == pygame.QUIT:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
-                # Test con tastiera se non c'è seriale
-                if not self.ser:
+                # Simulazione pulsante GPIO con SPAZIO se non c'è GPIO
+                if event.key == pygame.K_SPACE and not GPIO_AVAILABLE:
+                    if self.current_state == self.STATE_WAITING:
+                        self.button_pressed = True
+                        
+                # Test con tastiera se non c'è seriale (solo durante la lettura)
+                if not self.ser and self.current_state == self.STATE_READING:
                     if event.key == pygame.K_UP:
                         self.target_value = min(self.max_value, self.target_value + 0.1)
                     elif event.key == pygame.K_DOWN:
@@ -599,39 +760,62 @@ class AlcoholMeter:
                     elif event.key == pygame.K_r:
                         self.target_value = 0
                         self.max_reached_value = 0
-                        self.is_final_result = False
-                        self.value_stable_time = 0
+                        
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
 
-    def run(self):
-        """Loop principale"""
-        while self.running:
-            self.handle_events()
-            self.update_values()
-            self.add_particles()
-            self.update_particles()
-
-            # Disegna tutto
-            self.draw_background()
-            self.draw_gauge()
-            self.draw_needle()
-            self.draw_display()
-            self.draw_status()
-
-            # Disegna particelle
-            for particle in self.particles:
-                particle.draw(self.screen)
-
-            pygame.display.flip()
-            self.clock.tick(FPS)
-
-        # Chiudi connessione seriale
+    def cleanup(self):
+        """Pulizia delle risorse"""
+        if GPIO_AVAILABLE:
+            try:
+                GPIO.cleanup()
+                print("GPIO cleanup completato")
+            except Exception as e:
+                print(f"Errore durante GPIO cleanup: {e}")
+        
         if self.ser:
             self.ser.close()
-        pygame.quit()
+
+    def run(self):
+        """Loop principale"""
+        try:
+            while self.running:
+                self.handle_events()
+                self.update_values()
+                self.add_particles()
+                self.update_particles()
+
+                # Disegna lo sfondo
+                self.draw_background()
+
+                # Disegna la schermata appropriata in base allo stato
+                if self.current_state == self.STATE_WAITING:
+                    self.draw_waiting_screen()
+                elif self.current_state == self.STATE_INSTRUCTIONS:
+                    self.draw_instructions_screen()
+                elif self.current_state in [self.STATE_READING, self.STATE_RESULT]:
+                    self.draw_gauge()
+                    self.draw_needle()
+                    self.draw_display()
+                    self.draw_status()
+
+                # Disegna particelle (solo durante lettura/risultato)
+                if self.current_state in [self.STATE_READING, self.STATE_RESULT]:
+                    for particle in self.particles:
+                        particle.draw(self.screen)
+
+                pygame.display.flip()
+                self.clock.tick(FPS)
+
+        except KeyboardInterrupt:
+            print("\nInterrotto dall'utente")
+        finally:
+            self.cleanup()
+            pygame.quit()
 
 
 if __name__ == "__main__":
     app = AlcoholMeter()
+    app.run()
+    GPIO_AVAILABLE = True
     app.run()
